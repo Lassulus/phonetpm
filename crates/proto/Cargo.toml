@@ -1,0 +1,9 @@
+[package]
+name = "phonetpm-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true

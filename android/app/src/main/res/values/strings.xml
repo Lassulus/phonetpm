@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">phonetpm</string>
+    <string name="channel_service">Service status</string>
+    <string name="channel_requests">Approval requests</string>
+    <string name="notif_listening">phonetpm listening — %1$s</string>
+    <string name="notif_starting">phonetpm starting…</string>
+    <string name="notif_request_title">phonetpm request</string>
+    <string name="notif_request_pair">Pairing request from %1$s</string>
+    <string name="notif_request_sign">SSH signature for %1$s</string>
+    <string name="notif_request_ecdh">age decrypt for %1$s</string>
+</resources>

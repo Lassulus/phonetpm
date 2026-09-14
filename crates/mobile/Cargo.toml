@@ -1,0 +1,30 @@
+[package]
+name = "phonetpm-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+name = "phonetpm_mobile"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+phonetpm-proto.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+tracing = { version = "0.1", features = ["log"] }
+uniffi = { version = "0.32", features = ["cli"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+android_logger = "0.15"
+log = "0.4"
+
+[dev-dependencies]
+p256.workspace = true
+rand.workspace = true
+parking_lot = "0.12"

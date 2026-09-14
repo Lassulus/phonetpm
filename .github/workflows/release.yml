@@ -1,0 +1,84 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PHONETPM_VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/gradle/libs.versions.toml', 'android/**/*.kts') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Build host binaries
+        run: nix develop -c cargo build -p phonetpm --release
+
+      - name: Run tests
+        run: nix develop -c cargo test --workspace
+
+      - name: Build Android native library + bindings
+        run: nix develop -c scripts/build-android-lib.sh
+
+      - name: Import release keystore
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: nix develop -c gradle -p android --no-daemon assembleRelease
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/phonetpm-${PHONETPM_VERSION}-x86_64-linux.tar.gz" phonetpm age-plugin-phone
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/phonetpm-${PHONETPM_VERSION}.apk"
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phonetpm-${{ env.PHONETPM_VERSION }}
+          path: dist/*
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

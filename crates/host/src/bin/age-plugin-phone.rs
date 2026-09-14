@@ -1,0 +1,213 @@
+//! age plugin: encrypts to `age1phone1…` recipients locally and decrypts
+//! `AGE-PLUGIN-PHONE-1…` identities through the phonetpm daemon.
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+
+use age_core::format::{FileKey, Stanza};
+use age_core::secrecy::ExposeSecret;
+use age_plugin::{identity, recipient, run_state_machine, Callbacks, PluginHandler};
+use clap::Parser;
+
+use phonetpm::agekey::{Identity, ParsedStanza, Recipient, PLUGIN_NAME};
+use phonetpm::control;
+use phonetpm::proto::{Request, Response};
+
+#[derive(Parser)]
+#[command(version, about = "age plugin backed by phonetpm")]
+struct Opts {
+    /// Run the given age plugin state machine (set by the age client).
+    #[arg(long, value_name = "STATE-MACHINE")]
+    age_plugin: Option<String>,
+}
+
+fn main() -> io::Result<()> {
+    let opts = Opts::parse();
+    match opts.age_plugin {
+        Some(sm) => run_state_machine(&sm, Handler),
+        None => {
+            eprintln!(
+                "age-plugin-phone is started by age/rage; it is not meant to be run directly.\n\
+                 \n\
+                 Create an identity file with the phonetpm daemon running:\n\
+                 \n\
+                 \x20   phonetpm keys\n\
+                 \x20   phonetpm identity <key id or label> > phone.txt\n\
+                 \x20   age -d -i phone.txt file.age"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+struct Handler;
+
+impl PluginHandler for Handler {
+    type RecipientV1 = RecipientPlugin;
+    type IdentityV1 = IdentityPlugin;
+
+    fn recipient_v1(self) -> io::Result<Self::RecipientV1> {
+        Ok(RecipientPlugin::default())
+    }
+
+    fn identity_v1(self) -> io::Result<Self::IdentityV1> {
+        Ok(IdentityPlugin::default())
+    }
+}
+
+#[derive(Default)]
+struct RecipientPlugin {
+    recipients: Vec<Recipient>,
+}
+
+impl recipient::RecipientPluginV1 for RecipientPlugin {
+    fn add_recipient(&mut self, index: usize, plugin_name: &str, bytes: &[u8]) -> Result<(), recipient::Error> {
+        if plugin_name != PLUGIN_NAME {
+            return Err(recipient::Error::Recipient {
+                index,
+                message: format!("unknown recipient type age1{plugin_name}"),
+            });
+        }
+        let r = Recipient::from_bytes(bytes)
+            .map_err(|e| recipient::Error::Recipient { index, message: e.to_string() })?;
+        self.recipients.push(r);
+        Ok(())
+    }
+
+    fn add_identity(&mut self, index: usize, plugin_name: &str, bytes: &[u8]) -> Result<(), recipient::Error> {
+        if plugin_name != PLUGIN_NAME {
+            return Err(recipient::Error::Identity {
+                index,
+                message: format!("unknown identity type AGE-PLUGIN-{}-", plugin_name.to_uppercase()),
+            });
+        }
+        let id = Identity::from_bytes(bytes)
+            .map_err(|e| recipient::Error::Identity { index, message: e.to_string() })?;
+        self.recipients.push(id.recipient().clone());
+        Ok(())
+    }
+
+    fn labels(&mut self) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    fn wrap_file_keys(
+        &mut self,
+        file_keys: Vec<FileKey>,
+        _callbacks: impl Callbacks<recipient::Error>,
+    ) -> io::Result<Result<Vec<Vec<Stanza>>, Vec<recipient::Error>>> {
+        Ok(Ok(file_keys
+            .iter()
+            .map(|fk| self.recipients.iter().map(|r| r.wrap(fk.expose_secret())).collect())
+            .collect()))
+    }
+}
+
+#[derive(Default)]
+struct IdentityPlugin {
+    identities: Vec<Identity>,
+}
+
+impl IdentityPlugin {
+    /// Asks the phone for the ECDH result and unwraps the stanza.
+    fn unwrap(
+        &self,
+        daemon: &mut control::Client,
+        callbacks: &mut impl Callbacks<identity::Error>,
+        ident_index: usize,
+        stanza: &ParsedStanza,
+    ) -> Result<FileKey, identity::Error> {
+        let ident = &self.identities[ident_index];
+        let error = |message: String| identity::Error::Identity { index: ident_index, message };
+        let _ = callbacks.message("Confirm on your phone to unlock the file key");
+        let req = Request::Ecdh {
+            key_id: ident.key_id().to_owned(),
+            peer_public_key: stanza.ephemeral_spki(),
+        };
+        let shared = match daemon.request(&req).map_err(|e| error(e.to_string()))? {
+            Response::SharedSecret(x) => x,
+            Response::Denied => {
+                return Err(error("the phone denied the request (declined, or host not paired)".into()))
+            }
+            Response::UnknownKey => {
+                return Err(error(format!("the phone has no key {:?}", ident.key_id())))
+            }
+            Response::Error(e) => return Err(error(format!("phonetpm daemon: {e}"))),
+            other => return Err(error(format!("unexpected response {other:?}"))),
+        };
+        let file_key = ident.unwrap(stanza, &shared).map_err(|e| error(e.to_string()))?;
+        Ok(FileKey::init_with_mut(|fk| fk.copy_from_slice(&file_key)))
+    }
+}
+
+impl identity::IdentityPluginV1 for IdentityPlugin {
+    fn add_identity(&mut self, index: usize, plugin_name: &str, bytes: &[u8]) -> Result<(), identity::Error> {
+        if plugin_name != PLUGIN_NAME {
+            return Err(identity::Error::Identity {
+                index,
+                message: format!("unknown identity type AGE-PLUGIN-{}-", plugin_name.to_uppercase()),
+            });
+        }
+        let id = Identity::from_bytes(bytes)
+            .map_err(|e| identity::Error::Identity { index, message: e.to_string() })?;
+        self.identities.push(id);
+        Ok(())
+    }
+
+    fn unwrap_file_keys(
+        &mut self,
+        files: Vec<Vec<Stanza>>,
+        mut callbacks: impl Callbacks<identity::Error>,
+    ) -> io::Result<HashMap<usize, Result<FileKey, Vec<identity::Error>>>> {
+        let mut daemon: Option<control::Client> = None;
+        let mut out = HashMap::new();
+        for (file_index, stanzas) in files.into_iter().enumerate() {
+            let mut errors = Vec::new();
+            let mut file_key = None;
+            for (stanza_index, stanza) in stanzas.iter().enumerate() {
+                let parsed = match ParsedStanza::parse(stanza) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        errors.push(identity::Error::Stanza {
+                            file_index,
+                            stanza_index,
+                            message: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                let Some(ident_index) = self.identities.iter().position(|i| i.matches(&parsed)) else {
+                    continue;
+                };
+                let client = match &mut daemon {
+                    Some(c) => c,
+                    None => match control::Client::connect() {
+                        Ok(c) => daemon.insert(c),
+                        Err(e) => {
+                            errors.push(identity::Error::Internal { message: e.to_string() });
+                            break;
+                        }
+                    },
+                };
+                match self.unwrap(client, &mut callbacks, ident_index, &parsed) {
+                    Ok(fk) => {
+                        file_key = Some(fk);
+                        break;
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+            match file_key {
+                Some(fk) => {
+                    out.insert(file_index, Ok(fk));
+                }
+                None if !errors.is_empty() => {
+                    out.insert(file_index, Err(errors));
+                }
+                None => {}
+            }
+        }
+        Ok(out)
+    }
+}

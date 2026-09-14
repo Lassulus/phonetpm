@@ -1,0 +1,37 @@
+[package]
+name = "phonetpm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "phonetpm"
+
+[[bin]]
+name = "phonetpm"
+path = "src/main.rs"
+
+[[bin]]
+name = "age-plugin-phone"
+path = "src/bin/age-plugin-phone.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+phonetpm-proto.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+p256.workspace = true
+sha2.workspace = true
+base64.workspace = true
+bech32.workspace = true
+rand.workspace = true
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+libc = "0.2"
+age-plugin = "0.7"
+age-core = "0.12"
